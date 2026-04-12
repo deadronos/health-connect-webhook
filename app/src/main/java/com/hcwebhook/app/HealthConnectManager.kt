@@ -379,49 +379,25 @@ class HealthConnectManager(private val context: Context) {
         endTime: Instant,
         lastSync: Instant?
     ): List<StepsData> {
-        // Aggregate steps per calendar day (using device timezone) instead of
-        // a single multi-day total. This produces clean per-day records that
-        // the server can use directly without delta-tracking hacks.
-        val zone = java.time.ZoneId.systemDefault()
-        val result = mutableListOf<StepsData>()
-
-        val startLocalDate = startTime.atZone(zone).toLocalDate()
-        val endLocalDate = endTime.atZone(zone).toLocalDate()
-
-        var currentDate = startLocalDate
-        while (!currentDate.isAfter(endLocalDate)) {
-            val dayStart = currentDate.atStartOfDay(zone).toInstant()
-            val dayEnd = currentDate.plusDays(1).atStartOfDay(zone).toInstant()
-
-            // Clamp to the actual lookback window
-            val queryStart = if (dayStart.isBefore(startTime)) startTime else dayStart
-            val queryEnd = if (dayEnd.isAfter(endTime)) endTime else dayEnd
-
-            // Skip days entirely before lastSync
-            if (lastSync != null && queryEnd.isBefore(lastSync)) {
-                currentDate = currentDate.plusDays(1)
-                continue
+        // Read individual step records to preserve granular time ranges
+        // (e.g. 30-min intervals from wearables) instead of aggregating
+        // into a single daily total.
+        val request = ReadRecordsRequest(
+            recordType = StepsRecord::class,
+            timeRangeFilter = TimeRangeFilter.between(startTime, endTime)
+        )
+        val response = healthConnectClient.readRecords(request)
+        return response.records
+            .filter { record ->
+                lastSync == null || record.endTime >= lastSync
             }
-
-            val request = AggregateRequest(
-                metrics = setOf(StepsRecord.COUNT_TOTAL),
-                timeRangeFilter = TimeRangeFilter.between(queryStart, queryEnd)
-            )
-            val response = healthConnectClient.aggregate(request)
-            val daySteps = response[StepsRecord.COUNT_TOTAL] ?: 0L
-
-            if (daySteps > 0) {
-                result.add(StepsData(
-                    count = daySteps,
-                    startTime = dayStart,
-                    endTime = queryEnd
-                ))
+            .map { record ->
+                StepsData(
+                    count = record.count,
+                    startTime = record.startTime,
+                    endTime = record.endTime
+                )
             }
-
-            currentDate = currentDate.plusDays(1)
-        }
-
-        return result
     }
 
     private suspend fun readSleepData(
