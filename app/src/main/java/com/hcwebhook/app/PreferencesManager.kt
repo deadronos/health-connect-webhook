@@ -37,6 +37,37 @@ class PreferencesManager(context: Context) {
         private const val KEY_SCHEDULED_SYNCS = "scheduled_syncs"
         private const val KEY_KNOWN_GRANTED_PERMISSIONS = "known_granted_permissions"
         private const val KEY_HAS_SEEN_ONBOARDING = "has_seen_onboarding"
+        private const val KEY_HYBRID_BATCHING_ENABLED = "hybrid_batching_enabled"
+        private const val KEY_URL_CHECKPOINT_PREFIX = "url_checkpoint_"
+        private const val KEY_URL_LAST_BATCH_ID_PREFIX = "url_last_batch_id_"
+        private const val KEY_URL_LAST_SYNC_TIME_PREFIX = "url_last_sync_time_"
+    }
+
+    fun isHybridBatchingEnabled(): Boolean = prefs.getBoolean(KEY_HYBRID_BATCHING_ENABLED, true)
+
+    fun setHybridBatchingEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_HYBRID_BATCHING_ENABLED, enabled).apply()
+    }
+
+    fun getUrlCheckpointTimestamp(url: String, type: HealthDataType): Long? {
+        val key = "${KEY_URL_CHECKPOINT_PREFIX}${url.hashCode()}_${type.name}"
+        val ts = prefs.getLong(key, -1)
+        return if (ts == -1L) null else ts
+    }
+
+    fun setUrlCheckpointTimestamp(url: String, type: HealthDataType, timestamp: Long) {
+        val key = "${KEY_URL_CHECKPOINT_PREFIX}${url.hashCode()}_${type.name}"
+        prefs.edit().putLong(key, timestamp).apply()
+    }
+
+    fun setUrlLastBatchId(url: String, batchId: String) {
+        val key = "${KEY_URL_LAST_BATCH_ID_PREFIX}${url.hashCode()}"
+        prefs.edit().putString(key, batchId).apply()
+    }
+
+    fun setUrlLastSyncTime(url: String, timestamp: Long) {
+        val key = "${KEY_URL_LAST_SYNC_TIME_PREFIX}${url.hashCode()}"
+        prefs.edit().putLong(key, timestamp).apply()
     }
 
 

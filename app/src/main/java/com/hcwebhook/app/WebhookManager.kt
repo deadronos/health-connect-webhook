@@ -97,6 +97,75 @@ class WebhookManager(
         }
     }
 
+    suspend fun postBatch(
+        config: WebhookConfig,
+        jsonPayload: String,
+        idempotencyKey: String,
+        batchIndex: Int,
+        batchCount: Int
+    ): BatchPostResult {
+        val timestamp = System.currentTimeMillis()
+        var statusCode: Int? = null
+        var errorMessage: String? = null
+
+        return try {
+            val requestBody = jsonPayload.toRequestBody(jsonMediaType)
+            val requestBuilder = Request.Builder()
+                .url(config.url)
+                .post(requestBody)
+                .header("Idempotency-Key", idempotencyKey)
+                .header("X-Batch-Index", batchIndex.toString())
+                .header("X-Batch-Count", batchCount.toString())
+
+            config.headers.forEach { (key, value) ->
+                requestBuilder.addHeader(key, value)
+            }
+
+            val request = requestBuilder.build()
+
+            var lastResult: BatchPostResult? = null
+            for (attempt in 1..MAX_RETRIES) {
+                try {
+                    val response = client.newCall(request).execute()
+                    statusCode = response.code
+                    if (response.isSuccessful) {
+                        logWebhookCall(config.url, timestamp, statusCode, true, null)
+                        return BatchPostResult.Success(statusCode)
+                    } else {
+                        errorMessage = "HTTP ${response.code}: ${response.message}"
+                        lastResult = if (response.code >= 500 || response.code == 429) {
+                            BatchPostResult.TransientFailure(response.code, errorMessage)
+                        } else {
+                            BatchPostResult.PermanentFailure(response.code, errorMessage)
+                        }
+                    }
+                } catch (e: IOException) {
+                    errorMessage = e.message
+                    lastResult = BatchPostResult.TransientFailure(null, errorMessage ?: "IOException")
+                }
+
+                if (attempt < MAX_RETRIES && lastResult is BatchPostResult.TransientFailure) {
+                    val delayMs = INITIAL_RETRY_DELAY_MS * (2.0.pow(attempt - 1).toLong())
+                    kotlinx.coroutines.delay(delayMs)
+                } else if (lastResult is BatchPostResult.PermanentFailure) {
+                    break
+                }
+            }
+
+            logWebhookCall(config.url, timestamp, statusCode, false, errorMessage)
+            lastResult ?: BatchPostResult.PermanentFailure(null, "Max retries exceeded")
+        } catch (e: Exception) {
+            logWebhookCall(config.url, timestamp, null, false, e.message)
+            BatchPostResult.PermanentFailure(null, e.message ?: "Unknown error")
+        }
+    }
+
+    sealed class BatchPostResult {
+        data class Success(val statusCode: Int) : BatchPostResult()
+        data class TransientFailure(val statusCode: Int?, val error: String) : BatchPostResult()
+        data class PermanentFailure(val statusCode: Int?, val error: String) : BatchPostResult()
+    }
+
     private fun logWebhookCall(
         url: String,
         timestamp: Long,
