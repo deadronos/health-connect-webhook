@@ -3,13 +3,12 @@ package com.hcwebhook.app
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.security.MessageDigest
 
 class SyncManager(private val context: Context) {
 
@@ -39,9 +38,14 @@ class SyncManager(private val context: Context) {
             // Keep incremental sync only for default mode.
             // Explicit ranges (start/end or timeRangeDays) always perform a full read of that window.
             val hasExplicitRange = start != null || end != null || timeRangeDays != null
+            val useHybridBatching = preferencesManager.isHybridBatchingEnabled()
             val lastSyncTimestamps = if (!hasExplicitRange) {
                 enabledTypes.associateWith { type ->
-                    preferencesManager.getLastSyncTimestamp(type)?.let { Instant.ofEpochMilli(it) }
+                    if (useHybridBatching) {
+                        resolveReadCursorForType(type, webhookConfigs)
+                    } else {
+                        preferencesManager.getLastSyncTimestamp(type)?.let { Instant.ofEpochMilli(it) }
+                    }
                 }
             } else {
                 emptyMap()
@@ -86,18 +90,80 @@ class SyncManager(private val context: Context) {
                 recordCount = totalRecords
             )
 
-            // Build JSON payload
-            val jsonPayload = buildJsonPayload(healthData)
+            if (useHybridBatching) {
+                val planner = HybridBatchPlanner(maxBodyBytes = HybridBatchPlanner.MAX_BODY_BYTES_DEFAULT)
+                val plannedBatches = planner.buildBatches(healthData)
+                if (plannedBatches.isFailure) {
+                    return@withContext Result.failure(plannedBatches.exceptionOrNull() ?: Exception("Failed to plan batched payloads"))
+                }
 
-            // Post to webhook
-            val postResult = webhookManager.postData(jsonPayload)
-            if (postResult.isFailure) {
-                return@withContext Result.failure(postResult.exceptionOrNull() ?: Exception("Failed to post to webhooks"))
+                val batches = plannedBatches.getOrThrow()
+                if (batches.isEmpty()) {
+                    preferencesManager.setLastSyncTime(Instant.now().toEpochMilli())
+                    preferencesManager.setLastSyncSummary("No new data")
+                    return@withContext Result.success(SyncResult.NoData)
+                }
+
+                var anyUrlFailed = false
+
+                for (config in webhookConfigs) {
+                    var urlFailed = false
+
+                    for (batch in batches) {
+                        if (!hasExplicitRange && !shouldSendBatchToUrl(config.url, batch)) {
+                            continue
+                        }
+
+                        val idempotencyKey = buildIdempotencyKey(config.url, batch)
+                        val postResult = webhookManager.postBatch(
+                            config,
+                            batch.payload,
+                            idempotencyKey,
+                            batchIndex = batch.batchIndex,
+                            batchCount = batch.batchCount
+                        )
+                        when (postResult) {
+                            is WebhookManager.BatchPostResult.Success -> {
+                                if (!hasExplicitRange) {
+                                    persistBatchCheckpoint(config.url, batch)
+                                }
+                            }
+
+                            is WebhookManager.BatchPostResult.TransientFailure,
+                            is WebhookManager.BatchPostResult.PermanentFailure -> {
+                                urlFailed = true
+                                anyUrlFailed = true
+                                break
+                            }
+                        }
+                    }
+
+                    if (!urlFailed && !hasExplicitRange) {
+                        preferencesManager.setUrlLastSyncTime(config.url, Instant.now().toEpochMilli())
+                    }
+                }
+
+                if (anyUrlFailed) {
+                    preferencesManager.setLastSyncTime(Instant.now().toEpochMilli())
+                    preferencesManager.setLastSyncSummary("Partial failure: some webhooks did not acknowledge all batches")
+                    return@withContext Result.failure(Exception("One or more webhooks failed during batched sync"))
+                }
+            } else {
+                // Legacy one-request payload path (feature-flag fallback)
+                val jsonPayload = buildJsonPayload(healthData)
+                val postResult = webhookManager.postData(jsonPayload)
+                if (postResult.isFailure) {
+                    return@withContext Result.failure(postResult.exceptionOrNull() ?: Exception("Failed to post to webhooks"))
+                }
             }
 
             // Update last sync timestamps
             val syncCounts = mutableMapOf<HealthDataType, Int>()
-            updateSyncTimestamps(healthData, syncCounts)
+            if (!hasExplicitRange && useHybridBatching) {
+                updateGlobalTimestampsFromWebhookCheckpoints(enabledTypes, webhookConfigs, healthData, syncCounts)
+            } else {
+                updateSyncTimestamps(healthData, syncCounts)
+            }
 
             // Save last sync status for UI display
             val summary = buildSyncSummary(healthData)
@@ -108,6 +174,87 @@ class SyncManager(private val context: Context) {
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    private fun resolveReadCursorForType(type: HealthDataType, webhookConfigs: List<WebhookConfig>): Instant? {
+        val perUrlCursor = webhookConfigs.mapNotNull { config ->
+            preferencesManager.getUrlCheckpointTimestamp(config.url, type)?.let { Instant.ofEpochMilli(it) }
+        }.minOrNull()
+
+        return perUrlCursor ?: preferencesManager.getLastSyncTimestamp(type)?.let { Instant.ofEpochMilli(it) }
+    }
+
+    private fun persistBatchCheckpoint(url: String, batch: BatchPayload) {
+        batch.maxTimestampsByType.forEach { (type, instant) ->
+            preferencesManager.setUrlCheckpointTimestamp(url, type, instant.toEpochMilli())
+        }
+        preferencesManager.setUrlLastBatchId(url, batch.batchId)
+    }
+
+    private fun updateGlobalTimestampsFromWebhookCheckpoints(
+        enabledTypes: Set<HealthDataType>,
+        webhookConfigs: List<WebhookConfig>,
+        healthData: HealthData,
+        syncCounts: MutableMap<HealthDataType, Int>
+    ) {
+        val countsByType = buildTypeCountMap(healthData)
+        enabledTypes.forEach { type ->
+            val fullyAcknowledgedTimestamp = webhookConfigs.mapNotNull { config ->
+                preferencesManager.getUrlCheckpointTimestamp(config.url, type)
+            }.minOrNull()
+
+            if (fullyAcknowledgedTimestamp != null) {
+                preferencesManager.setLastSyncTimestamp(type, fullyAcknowledgedTimestamp)
+                syncCounts[type] = countsByType[type] ?: 0
+            }
+        }
+    }
+
+    private fun buildTypeCountMap(data: HealthData): Map<HealthDataType, Int> {
+        return mapOf(
+            HealthDataType.STEPS to data.steps.size,
+            HealthDataType.SLEEP to data.sleep.size,
+            HealthDataType.HEART_RATE to data.heartRate.size,
+            HealthDataType.HEART_RATE_VARIABILITY to data.heartRateVariability.size,
+            HealthDataType.DISTANCE to data.distance.size,
+            HealthDataType.ACTIVE_CALORIES to data.activeCalories.size,
+            HealthDataType.TOTAL_CALORIES to data.totalCalories.size,
+            HealthDataType.WEIGHT to data.weight.size,
+            HealthDataType.HEIGHT to data.height.size,
+            HealthDataType.BLOOD_PRESSURE to data.bloodPressure.size,
+            HealthDataType.BLOOD_GLUCOSE to data.bloodGlucose.size,
+            HealthDataType.OXYGEN_SATURATION to data.oxygenSaturation.size,
+            HealthDataType.BODY_TEMPERATURE to data.bodyTemperature.size,
+            HealthDataType.RESPIRATORY_RATE to data.respiratoryRate.size,
+            HealthDataType.RESTING_HEART_RATE to data.restingHeartRate.size,
+            HealthDataType.EXERCISE to data.exercise.size,
+            HealthDataType.HYDRATION to data.hydration.size,
+            HealthDataType.NUTRITION to data.nutrition.size,
+            HealthDataType.BASAL_METABOLIC_RATE to data.basalMetabolicRate.size,
+            HealthDataType.BODY_FAT to data.bodyFat.size,
+            HealthDataType.LEAN_BODY_MASS to data.leanBodyMass.size,
+            HealthDataType.VO2_MAX to data.vo2Max.size,
+            HealthDataType.BONE_MASS to data.boneMass.size
+        )
+    }
+
+    private fun buildIdempotencyKey(url: String, batch: BatchPayload): String {
+        val normalizedUrl = url.trim().lowercase()
+        val urlHash = sha256Hex(normalizedUrl).take(12)
+        val payloadHash = sha256Hex(batch.payload).take(12)
+        return "hcw:v2:$urlHash:${batch.batchIndex}:$payloadHash"
+    }
+
+    private fun shouldSendBatchToUrl(url: String, batch: BatchPayload): Boolean {
+        return batch.maxTimestampsByType.any { (type, maxTimestamp) ->
+            val checkpoint = preferencesManager.getUrlCheckpointTimestamp(url, type)?.let { Instant.ofEpochMilli(it) }
+            checkpoint == null || checkpoint.isBefore(maxTimestamp)
+        }
+    }
+
+    private fun sha256Hex(value: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(StandardCharsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
     }
 
     private fun isHealthDataEmpty(data: HealthData): Boolean {
