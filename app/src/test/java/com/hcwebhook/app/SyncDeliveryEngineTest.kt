@@ -3,7 +3,6 @@ package com.hcwebhook.app
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
-import java.time.Duration
 import java.time.Instant
 import java.io.IOException
 
@@ -36,19 +35,6 @@ class SyncDeliveryEngineTest {
         )
     }
 
-    private fun emptyHealthData() = HealthData(
-        steps = emptyList(), sleep = emptyList(), heartRate = emptyList(),
-        heartRateVariability = emptyList(), distance = emptyList(),
-        activeCalories = emptyList(), totalCalories = emptyList(),
-        weight = emptyList(), height = emptyList(), bloodPressure = emptyList(),
-        bloodGlucose = emptyList(), oxygenSaturation = emptyList(),
-        bodyTemperature = emptyList(), respiratoryRate = emptyList(),
-        restingHeartRate = emptyList(), exercise = emptyList(),
-        hydration = emptyList(), nutrition = emptyList(),
-        basalMetabolicRate = emptyList(), bodyFat = emptyList(),
-        leanBodyMass = emptyList(), vo2Max = emptyList(), boneMass = emptyList()
-    )
-
     // ── SyncDeliveryEngine ────────────────────────────────────────────────────
 
     /**
@@ -70,16 +56,21 @@ class SyncDeliveryEngineTest {
 
         suspend fun deliver(
             configs: List<WebhookConfig>,
-            batches: List<BatchPayload>
+            batches: List<BatchPayload>,
+            hasExplicitRange: Boolean = false
         ): DeliveryOutcome {
             val failedUrls = mutableListOf<String>()
 
             for (config in configs) {
                 var urlFailed = false
                 for (batch in batches) {
-                    if (!shouldSend(config.url, batch)) continue
-                    when (val result = postFn(config.url, batch)) {
-                        is WebhookManager.BatchPostResult.Success -> persistCheckpoint(config.url, batch)
+                    if (!hasExplicitRange && !shouldSend(config.url, batch)) continue
+                    when (postFn(config.url, batch)) {
+                        is WebhookManager.BatchPostResult.Success -> {
+                            if (!hasExplicitRange) {
+                                persistCheckpoint(config.url, batch)
+                            }
+                        }
                         is WebhookManager.BatchPostResult.TransientFailure,
                         is WebhookManager.BatchPostResult.PermanentFailure -> {
                             urlFailed = true
@@ -87,8 +78,8 @@ class SyncDeliveryEngineTest {
                         }
                     }
                 }
-                if (!urlFailed) lastSyncTimes[config.url] = System.currentTimeMillis()
-                else failedUrls.add(config.url)
+                if (!urlFailed && !hasExplicitRange) lastSyncTimes[config.url] = System.currentTimeMillis()
+                else if (urlFailed) failedUrls.add(config.url)
             }
 
             return DeliveryOutcome(
@@ -117,7 +108,6 @@ class SyncDeliveryEngineTest {
             checkpoints[url]?.get(type)
 
         fun lastSyncTimeFor(url: String): Long? = lastSyncTimes[url]
-        fun lastBatchIdFor(url: String): String? = lastBatchIds[url]
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────
@@ -223,6 +213,32 @@ class SyncDeliveryEngineTest {
 
         // batch 0 should be skipped (already acknowledged), only batch 1 sent
         assertEquals(listOf(1), sentBatches)
+    }
+
+    @Test
+    fun explicit_range_bypasses_checkpoint() = runBlocking {
+        val base = Instant.parse("2026-04-01T10:00:00Z")
+        val url = "https://a.example.com"
+        val configs = listOf(makeConfig(url))
+        val batches = listOf(
+            makeBatch(0, 1, base.minusSeconds(100)) // Older than checkpoint
+        )
+
+        val checkpoints: MutableMap<String, MutableMap<HealthDataType, Long>> = mutableMapOf(
+            url to mutableMapOf(HealthDataType.STEPS to base.toEpochMilli())
+        )
+        val sentBatches = mutableListOf<Int>()
+        val engine = SyncDeliveryEngine(checkpoints = checkpoints) { _, batch ->
+            sentBatches.add(batch.batchIndex)
+            WebhookManager.BatchPostResult.Success(200)
+        }
+
+        // With hasExplicitRange = true, it should send even if checkpoint is ahead
+        engine.deliver(configs, batches, hasExplicitRange = true)
+
+        assertEquals(listOf(0), sentBatches)
+        // Checkpoint should NOT have changed because persistCheckpoint is skipped
+        assertEquals(base.toEpochMilli(), engine.checkpointFor(url, HealthDataType.STEPS))
     }
 
     @Test
