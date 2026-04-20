@@ -453,87 +453,75 @@ class HealthConnectManager(private val context: Context) {
     }
 
     private suspend fun readDistanceData(startTime: Instant, endTime: Instant, lastSync: Instant?): List<DistanceData> {
-        // Aggregate distance per calendar day (same pattern as steps)
         val zone = java.time.ZoneId.systemDefault()
-        val result = mutableListOf<DistanceData>()
+        val startLocalDateTime = startTime.atZone(zone).toLocalDateTime()
+        val endLocalDateTime = endTime.atZone(zone).toLocalDateTime()
 
-        val startLocalDate = startTime.atZone(zone).toLocalDate()
-        val endLocalDate = endTime.atZone(zone).toLocalDate()
+        val request = androidx.health.connect.client.request.AggregateGroupByPeriodRequest(
+            metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
+            timeRangeFilter = TimeRangeFilter.between(startLocalDateTime, endLocalDateTime),
+            timeRangeSlicer = java.time.Period.ofDays(1)
+        )
 
-        var currentDate = startLocalDate
-        while (!currentDate.isAfter(endLocalDate)) {
-            val dayStart = currentDate.atStartOfDay(zone).toInstant()
-            val dayEnd = currentDate.plusDays(1).atStartOfDay(zone).toInstant()
+        val response = healthConnectClient.aggregateGroupByPeriod(request)
 
-            val queryStart = if (dayStart.isBefore(startTime)) startTime else dayStart
-            val queryEnd = if (dayEnd.isAfter(endTime)) endTime else dayEnd
+        return response.mapNotNull { periodResult ->
+            val periodStart = periodResult.startTime.atZone(zone).toInstant()
+            val periodEnd = periodResult.endTime.atZone(zone).toInstant()
 
-            if (lastSync != null && queryEnd.isBefore(lastSync)) {
-                currentDate = currentDate.plusDays(1)
-                continue
+            // Check lastSync requirement: Skip periods ending before lastSync
+            if (lastSync != null && periodEnd.isBefore(lastSync)) {
+                return@mapNotNull null
             }
 
-            val request = AggregateRequest(
-                metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
-                timeRangeFilter = TimeRangeFilter.between(queryStart, queryEnd)
-            )
-            val response = healthConnectClient.aggregate(request)
-            val dayDistance = response[DistanceRecord.DISTANCE_TOTAL]?.inMeters ?: 0.0
+            val dayDistance = periodResult.result[DistanceRecord.DISTANCE_TOTAL]?.inMeters ?: 0.0
 
             if (dayDistance > 0.0) {
-                result.add(DistanceData(
+                DistanceData(
                     meters = dayDistance,
-                    startTime = dayStart,
-                    endTime = queryEnd
-                ))
+                    startTime = periodStart,
+                    endTime = periodEnd
+                )
+            } else {
+                null
             }
-
-            currentDate = currentDate.plusDays(1)
         }
-
-        return result
     }
 
     private suspend fun readActiveCaloriesData(startTime: Instant, endTime: Instant, lastSync: Instant?): List<ActiveCaloriesData> {
-        // Aggregate active calories per calendar day (same pattern as steps/distance)
         val zone = java.time.ZoneId.systemDefault()
-        val result = mutableListOf<ActiveCaloriesData>()
+        val startLocalDateTime = startTime.atZone(zone).toLocalDateTime()
+        val endLocalDateTime = endTime.atZone(zone).toLocalDateTime()
 
-        val startLocalDate = startTime.atZone(zone).toLocalDate()
-        val endLocalDate = endTime.atZone(zone).toLocalDate()
+        val request = androidx.health.connect.client.request.AggregateGroupByPeriodRequest(
+            metrics = setOf(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL),
+            timeRangeFilter = TimeRangeFilter.between(startLocalDateTime, endLocalDateTime),
+            timeRangeSlicer = java.time.Period.ofDays(1)
+        )
 
-        var currentDate = startLocalDate
-        while (!currentDate.isAfter(endLocalDate)) {
-            val dayStart = currentDate.atStartOfDay(zone).toInstant()
-            val dayEnd = currentDate.plusDays(1).atStartOfDay(zone).toInstant()
+        val response = healthConnectClient.aggregateGroupByPeriod(request)
 
-            val queryStart = if (dayStart.isBefore(startTime)) startTime else dayStart
-            val queryEnd = if (dayEnd.isAfter(endTime)) endTime else dayEnd
+        return response.mapNotNull { periodResult ->
+            val periodStart = periodResult.startTime.atZone(zone).toInstant()
+            val periodEnd = periodResult.endTime.atZone(zone).toInstant()
 
-            if (lastSync != null && queryEnd.isBefore(lastSync)) {
-                currentDate = currentDate.plusDays(1)
-                continue
+            // Check lastSync requirement: Skip periods ending before lastSync
+            if (lastSync != null && periodEnd.isBefore(lastSync)) {
+                return@mapNotNull null
             }
 
-            val request = AggregateRequest(
-                metrics = setOf(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL),
-                timeRangeFilter = TimeRangeFilter.between(queryStart, queryEnd)
-            )
-            val response = healthConnectClient.aggregate(request)
-            val dayCalories = response[ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL]?.inKilocalories ?: 0.0
+            val dayCalories = periodResult.result[ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL]?.inKilocalories ?: 0.0
 
             if (dayCalories > 0.0) {
-                result.add(ActiveCaloriesData(
+                ActiveCaloriesData(
                     calories = dayCalories,
-                    startTime = dayStart,
-                    endTime = queryEnd
-                ))
+                    startTime = periodStart,
+                    endTime = periodEnd
+                )
+            } else {
+                null
             }
-
-            currentDate = currentDate.plusDays(1)
         }
-
-        return result
     }
 
     private suspend fun readTotalCaloriesData(startTime: Instant, endTime: Instant, lastSync: Instant?): List<TotalCaloriesData> {
