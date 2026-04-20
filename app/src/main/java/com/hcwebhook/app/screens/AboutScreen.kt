@@ -3,6 +3,8 @@ package com.hcwebhook.app.screens
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import androidx.core.content.pm.PackageInfoCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -56,14 +58,22 @@ fun AboutScreen(activity: MainActivity, onRestartOnboarding: () -> Unit = {}) {
     val prettyJson = Json { prettyPrint = true }
 
     // ── Version info ──────────────────────────────────────────────────────────
-    val versionName = try {
-        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "Unknown"
-    } catch (e: PackageManager.NameNotFoundException) { "Unknown" }
+    val packageInfo = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.PackageInfoFlags.of(0)
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0)
+        }
+    } catch (e: PackageManager.NameNotFoundException) {
+        null
+    }
 
-    val versionCode = try {
-        @Suppress("DEPRECATION")
-        context.packageManager.getPackageInfo(context.packageName, 0).versionCode.toLong()
-    } catch (e: PackageManager.NameNotFoundException) { 0L }
+    val versionName = packageInfo?.versionName ?: "Unknown"
+    val versionCode = packageInfo?.let { PackageInfoCompat.getLongVersionCode(it) } ?: 0L
 
     // ── Import file picker ────────────────────────────────────────────────────
     val importLauncher = rememberLauncherForActivityResult(
