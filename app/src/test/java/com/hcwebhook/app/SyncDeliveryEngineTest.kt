@@ -146,7 +146,7 @@ class SyncDeliveryEngineTest {
 
         val engine = SyncDeliveryEngine { url, _ ->
             if (url == badUrl)
-                WebhookManager.BatchPostResult.PermanentFailure(IOException("403"), 403)
+                WebhookManager.BatchPostResult.PermanentFailure(403, "403")
             else
                 WebhookManager.BatchPostResult.Success(200)
         }
@@ -179,7 +179,7 @@ class SyncDeliveryEngineTest {
         val engine = SyncDeliveryEngine { _, batch ->
             sentBatches.add(batch.batchIndex)
             if (batch.batchIndex == 1)
-                WebhookManager.BatchPostResult.TransientFailure(IOException("timeout"))
+                WebhookManager.BatchPostResult.TransientFailure(null, "timeout")
             else
                 WebhookManager.BatchPostResult.Success(200)
         }
