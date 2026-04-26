@@ -10,9 +10,9 @@ enum class SyncMode {
     SCHEDULED    // Sync at specific times (morning & evening)
 }
 
-class PreferencesManager(context: Context) {
+class PreferencesManager(private val prefs: SharedPreferences) {
 
-    private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    constructor(context: Context) : this(context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE))
 
     companion object {
         private const val PREFS_NAME = "hc_webhook_prefs"
