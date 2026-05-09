@@ -438,11 +438,14 @@ class HealthConnectManager(private val context: Context) {
         val request = ReadRecordsRequest(recordType = HeartRateRecord::class, timeRangeFilter = TimeRangeFilter.between(startTime, endTime))
         val response = healthConnectClient.readRecords(request)
         return response.records
+            .asSequence()
             .flatMap { record ->
                 record.samples
+                    .asSequence()
                     .filter { lastSync == null || it.time >= lastSync }
                     .map { HeartRateData(it.beatsPerMinute, it.time) }
             }
+            .toList()
     }
 
     private suspend fun readHeartRateVariabilityData(startTime: Instant, endTime: Instant, lastSync: Instant?): List<HeartRateVariabilityData> {
